@@ -67,7 +67,25 @@ def find_competition(scoreboard, players):
     return None
 
 
-def ring_alarm(label):
+def get_state(comp):
+    return comp.get("status", {}).get("type", {}).get("state")
+
+
+def get_description(comp):
+    return comp.get("status", {}).get("type", {}).get("description")
+
+
+def get_scoreboard(scoreboard_cache, league):
+    if league not in scoreboard_cache:
+        try:
+            scoreboard_cache[league] = fetch_scoreboard(league)
+        except Exception as e:
+            print(f"[エラー] {league} のスコアボード取得に失敗: {e}")
+            scoreboard_cache[league] = None
+    return scoreboard_cache[league]
+
+
+def ring_alarm(label, headline="試合開始！"):
     def _play_sound():
         sound_file = next((p for p in ALARM_SOUND_CANDIDATES if p.exists()), None)
         if sound_file:
@@ -86,14 +104,14 @@ def ring_alarm(label):
     sound_thread.start()
 
     root = tk.Tk()
-    root.title("試合開始！")
+    root.title(headline)
     root.attributes("-topmost", True)
     root.configure(bg="#c0392b")
     root.geometry("520x260+400+300")
 
     msg = tk.Label(
         root,
-        text=f"試合開始！\n\n{label}",
+        text=f"{headline}\n\n{label}",
         font=("Yu Gothic UI", 18, "bold"),
         fg="white",
         bg="#c0392b",
@@ -137,19 +155,13 @@ def run():
             label = watch["label"]
             league = watch["league"]
             players = watch["players"]
+            previous_match = watch.get("previous_match")
             key = f"{league}:{'-'.join(players)}"
 
             if state.get(key, {}).get("done"):
                 continue
 
-            if league not in scoreboard_cache:
-                try:
-                    scoreboard_cache[league] = fetch_scoreboard(league)
-                except Exception as e:
-                    print(f"[エラー] {league} のスコアボード取得に失敗: {e}")
-                    scoreboard_cache[league] = None
-
-            scoreboard = scoreboard_cache[league]
+            scoreboard = get_scoreboard(scoreboard_cache, league)
             if scoreboard is None:
                 continue
 
@@ -158,22 +170,50 @@ def run():
                 print(f"[{label}] 対象の試合がまだ見つかりません（スケジュール未確定の可能性）")
                 continue
 
-            current_state = comp.get("status", {}).get("type", {}).get("state")
-            description = comp.get("status", {}).get("type", {}).get("description")
+            current_state = get_state(comp)
+            description = get_description(comp)
             prev_state = state.get(key, {}).get("last_state")
+            first_observation = key not in state
 
             print(f"[{label}] 状態: {description} ({current_state})")
-
-            first_observation = key not in state
 
             if first_observation and current_state == "post":
                 # 監視開始時点で既に終了している試合は鳴らさない
                 state[key] = {"last_state": current_state, "done": True}
             elif current_state == "in" and (first_observation or prev_state != "in"):
+                # 対象の試合自体が開始済み（前の試合の情報が無い/取れない場合のフォールバック）
                 state[key] = {"last_state": current_state, "done": True}
                 save_state(state)
                 print(f"[{label}] 試合開始を検知！アラームを鳴らします。")
-                threading.Thread(target=ring_alarm, args=(label,), daemon=True).start()
+                threading.Thread(
+                    target=ring_alarm, args=(label, "試合開始！"), daemon=True
+                ).start()
+            elif current_state == "pre" and previous_match:
+                prev_league = previous_match.get("league", league)
+                prev_scoreboard = get_scoreboard(scoreboard_cache, prev_league)
+                prev_comp = (
+                    find_competition(prev_scoreboard, previous_match["players"])
+                    if prev_scoreboard
+                    else None
+                )
+                if prev_comp is None:
+                    print(f"[{label}] （前の試合がまだ見つかりません）")
+                    state.setdefault(key, {})["last_state"] = current_state
+                else:
+                    prev_state_value = get_state(prev_comp)
+                    prev_description = get_description(prev_comp)
+                    print(f"  └ 前の試合の状態: {prev_description} ({prev_state_value})")
+                    if prev_state_value == "post":
+                        state[key] = {"last_state": current_state, "done": True}
+                        save_state(state)
+                        print(f"[{label}] 前の試合が終了！まもなく開始します。アラームを鳴らします。")
+                        threading.Thread(
+                            target=ring_alarm,
+                            args=(label, "まもなく試合開始！（前の試合が終了しました）"),
+                            daemon=True,
+                        ).start()
+                    else:
+                        state.setdefault(key, {})["last_state"] = current_state
             else:
                 state.setdefault(key, {})["last_state"] = current_state
 

@@ -1,16 +1,19 @@
 {
-  "poll_interval_sec": 60,
+  "poll_interval_sec": 120,
   "watches": [
     {
       "label": "【検証用】ジョコビッチ vs サフィウリン（センターコート第1試合）",
       "league": "atp",
       "players": ["Djokovic", "Safiullin"],
-      "enabled": true
+      "enabled": false
     },
     {
       "label": "望月慎太郎 vs シナー（4回戦・センターコート第3試合）",
       "league": "atp",
       "players": ["Mochizuki", "Sinner"],
+      "previous_match": {
+        "players": ["Sabalenka", "Osaka"]
+      },
       "enabled": true
     }
   ]
