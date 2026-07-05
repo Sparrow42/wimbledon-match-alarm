@@ -12,6 +12,7 @@ import time
 import urllib.request
 import winsound
 import tkinter as tk
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -26,6 +27,11 @@ ALARM_SOUND_CANDIDATES = [
 ]
 
 SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/tennis/{league}/scoreboard"
+
+# 前の試合が「終了(post)」と連続で何回観測されたらアラームを鳴らすか。
+# 1回だけの判定だと、データ側の一時的な乱れ（後から In Progress に戻る等）を
+# 拾って試合途中で誤って鳴ってしまうことがあるため、連続確認で誤検知を防ぐ。
+PREVIOUS_MATCH_CONFIRMATIONS = 2
 
 
 def load_config():
@@ -53,8 +59,13 @@ def fetch_scoreboard(league):
 
 
 def find_competition(scoreboard, players):
-    """players（姓の一部）が両方とも競技者名に含まれる試合を探す"""
+    """players（姓の一部）が両方とも競技者名に含まれる試合を探す。
+
+    同じ2選手は大会中に複数回対戦する可能性がある（前の大会・別ラウンド等）ため、
+    候補が複数見つかった場合は現在時刻に最も近い（＝今まさに行われている）試合を選ぶ。
+    """
     wanted = [p.lower() for p in players]
+    candidates = []
     for event in scoreboard.get("events", []):
         for grouping in event.get("groupings", []):
             for comp in grouping.get("competitions", []):
@@ -63,8 +74,24 @@ def find_competition(scoreboard, players):
                     for c in comp.get("competitors", [])
                 ]
                 if all(any(w in n for n in names) for w in wanted):
-                    return comp
-    return None
+                    candidates.append(comp)
+
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    now = datetime.now(timezone.utc)
+
+    def time_distance(comp):
+        date_str = comp.get("date")
+        try:
+            dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return float("inf")
+        return abs((dt - now).total_seconds())
+
+    return min(candidates, key=time_distance)
 
 
 def get_state(comp):
@@ -198,22 +225,38 @@ def run():
                 )
                 if prev_comp is None:
                     print(f"[{label}] （前の試合がまだ見つかりません）")
-                    state.setdefault(key, {})["last_state"] = current_state
+                    entry = state.setdefault(key, {})
+                    entry["last_state"] = current_state
+                    entry["prev_confirm_count"] = 0
                 else:
                     prev_state_value = get_state(prev_comp)
                     prev_description = get_description(prev_comp)
                     print(f"  └ 前の試合の状態: {prev_description} ({prev_state_value})")
                     if prev_state_value == "post":
-                        state[key] = {"last_state": current_state, "done": True}
-                        save_state(state)
-                        print(f"[{label}] 前の試合が終了！まもなく開始します。アラームを鳴らします。")
-                        threading.Thread(
-                            target=ring_alarm,
-                            args=(label, "まもなく試合開始！（前の試合が終了しました）"),
-                            daemon=True,
-                        ).start()
+                        confirm_count = (
+                            state.get(key, {}).get("prev_confirm_count", 0) + 1
+                        )
+                        if confirm_count >= PREVIOUS_MATCH_CONFIRMATIONS:
+                            state[key] = {"last_state": current_state, "done": True}
+                            save_state(state)
+                            print(f"[{label}] 前の試合が終了！まもなく開始します。アラームを鳴らします。")
+                            threading.Thread(
+                                target=ring_alarm,
+                                args=(label, "まもなく試合開始！（前の試合が終了しました）"),
+                                daemon=True,
+                            ).start()
+                        else:
+                            print(
+                                f"  └ 前の試合の終了を確認中"
+                                f"（{confirm_count}/{PREVIOUS_MATCH_CONFIRMATIONS}回連続）"
+                            )
+                            entry = state.setdefault(key, {})
+                            entry["last_state"] = current_state
+                            entry["prev_confirm_count"] = confirm_count
                     else:
-                        state.setdefault(key, {})["last_state"] = current_state
+                        entry = state.setdefault(key, {})
+                        entry["last_state"] = current_state
+                        entry["prev_confirm_count"] = 0
             else:
                 state.setdefault(key, {})["last_state"] = current_state
 
