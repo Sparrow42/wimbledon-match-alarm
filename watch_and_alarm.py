@@ -6,10 +6,10 @@ config.json に書かれた試合（選手名のペア）をESPNの公開スコ�
 PC上でアラーム音とポップアップを出す。
 """
 import json
+import subprocess
 import sys
 import threading
 import time
-import urllib.request
 import winsound
 import tkinter as tk
 from datetime import datetime, timezone
@@ -51,11 +51,32 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def fetch_scoreboard(league):
+def fetch_scoreboard(league, retries=3):
+    """ESPNのスコアボードJSONを取得する。
+
+    PythonのurllibだとESPN側のBot対策(Akamai)に403で弾かれることがあるため、
+    Windows標準搭載のcurl.exe経由でリクエストする。
+    なお、ブラウザを装ったUser-Agent（Chrome等）を指定すると逆に弾かれ、
+    curlのデフォルトUser-Agent（何も指定しない状態）だと通ることを確認済みのため、
+    User-Agent等のヘッダーは一切指定しない。
+    """
     url = SCOREBOARD_URL.format(league=league)
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    curl_args = ["curl.exe", "-s", "--compressed", "--fail", url]
+
+    last_error = None
+    for attempt in range(retries):
+        try:
+            result = subprocess.run(
+                curl_args, capture_output=True, text=True, timeout=20, check=True
+            )
+            return json.loads(result.stdout)
+        except Exception as e:
+            # ESPN側のBot対策(Akamai)がまれに一時的に403を返すことがあるため、
+            # 短い間隔を空けて数回リトライする。
+            last_error = e
+            if attempt < retries - 1:
+                time.sleep(3)
+    raise last_error
 
 
 def find_competition(scoreboard, players):
@@ -183,6 +204,7 @@ def run():
             league = watch["league"]
             players = watch["players"]
             previous_match = watch.get("previous_match")
+            trigger = watch.get("trigger", "start")
             key = f"{league}:{'-'.join(players)}"
 
             if state.get(key, {}).get("done"):
@@ -203,6 +225,34 @@ def run():
             first_observation = key not in state
 
             print(f"[{label}] 状態: {description} ({current_state})")
+
+            if trigger == "end":
+                # 対象の試合そのものが終了(post)した瞬間を検知するモード。
+                # データの一時的な乱れによる誤検知を避けるため、連続確認してから鳴らす。
+                if current_state == "post":
+                    confirm_count = (
+                        state.get(key, {}).get("end_confirm_count", 0) + 1
+                    )
+                    if confirm_count >= PREVIOUS_MATCH_CONFIRMATIONS:
+                        state[key] = {"last_state": current_state, "done": True}
+                        save_state(state)
+                        print(f"[{label}] 試合終了を検知！アラームを鳴らします。")
+                        threading.Thread(
+                            target=ring_alarm, args=(label, "試合終了！"), daemon=True
+                        ).start()
+                    else:
+                        print(
+                            f"  └ 試合終了を確認中"
+                            f"（{confirm_count}/{PREVIOUS_MATCH_CONFIRMATIONS}回連続）"
+                        )
+                        entry = state.setdefault(key, {})
+                        entry["last_state"] = current_state
+                        entry["end_confirm_count"] = confirm_count
+                else:
+                    entry = state.setdefault(key, {})
+                    entry["last_state"] = current_state
+                    entry["end_confirm_count"] = 0
+                continue
 
             if first_observation and current_state == "post":
                 # 監視開始時点で既に終了している試合は鳴らさない
